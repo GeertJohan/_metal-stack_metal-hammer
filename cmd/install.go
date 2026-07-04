@@ -56,7 +56,16 @@ func (h *hammer) Install(machine *models.V1MachineResponse) (*installerv1.Bootin
 		return nil, err
 	}
 
-	s.Umount()
+	// A failed unmount used to be tolerated here, which silently lost the late writes above
+	// (most prominently the fstab) over the following kexec whenever a teardown unmount
+	// failed - the installed OS then booted with the image's placeholder fstab, a read-only
+	// root and none of the layout's extra filesystems. Failing the installation instead means
+	// the machine reports the error and retries, and the unmount path logs which process
+	// pinned the mount.
+	err = s.Umount()
+	if err != nil {
+		return nil, err
+	}
 
 	return info, nil
 }

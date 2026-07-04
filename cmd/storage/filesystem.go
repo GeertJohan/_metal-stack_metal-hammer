@@ -1,6 +1,7 @@
 package storage
 
 import (
+	"errors"
 	"fmt"
 	"log/slog"
 	gos "os"
@@ -11,6 +12,9 @@ import (
 	"sort"
 	"strings"
 	"syscall"
+	"time"
+
+	"golang.org/x/sys/unix"
 
 	"github.com/u-root/u-root/pkg/mount/block"
 
@@ -86,8 +90,8 @@ func (f *Filesystem) Run() error {
 
 	return nil
 }
-func (f *Filesystem) Umount() {
-	f.umountFilesystems()
+func (f *Filesystem) Umount() error {
+	return f.umountFilesystems()
 }
 
 func (f *Filesystem) createPartitions() error {
@@ -427,13 +431,12 @@ func (f *Filesystem) mountSpecialFilesystems() error {
 	return nil
 }
 
-func (f *Filesystem) umountFilesystems() {
+func (f *Filesystem) umountFilesystems() error {
+	var errs []error
 	for index := len(specialMounts) - 1; index >= 0; index-- {
 		m := filepath.Join(f.chroot, specialMounts[index].target)
-		f.log.Info("unmounting", "mountpoint", m)
-		err := syscall.Unmount(m, syscall.MNT_FORCE)
-		if err != nil {
-			f.log.Error("unable to unmount", "path", m, "error", err)
+		if err := f.unmount(m); err != nil {
+			errs = append(errs, err)
 		}
 	}
 	for index := len(f.mounts) - 1; index >= 0; index-- {
@@ -441,10 +444,88 @@ func (f *Filesystem) umountFilesystems() {
 		if m == "" {
 			continue
 		}
-		f.log.Info("unmounting", "mountpoint", m)
-		err := syscall.Unmount(m, syscall.MNT_FORCE)
+		if err := f.unmount(m); err != nil {
+			errs = append(errs, err)
+		}
+	}
+	if len(errs) > 0 {
+		return fmt.Errorf("unmounting filesystems failed: %w", errors.Join(errs...))
+	}
+	return nil
+}
+
+// unmount unmounts a single mountpoint and, unlike the previous MNT_FORCE-and-ignore-errors
+// approach, treats failure as a real error:
+//   - no MNT_FORCE: per umount(2) the flag only asks network filesystems (nfs, cifs, fuse, ...)
+//     to abort in-flight requests and "could cause data loss"; on local filesystems it is a
+//     no-op and cannot fix EBUSY.
+//   - EBUSY is retried for a while: the last reference is often dropped just after we closed
+//     it (same pattern as coreos-installer's unmount retry loop).
+//   - a persistently busy mount gets its pinning processes logged (/proc scan) and the error
+//     is returned - a machine that silently boots into a half-torn-down installation is worse
+//     than a failed installation that gets retried. Deliberately NO pre-unmount sync as a
+//     softener: it cannot protect against a process that keeps writing after the flush, so
+//     the only sound outcomes are a successful unmount (kernel flushes everything) or a
+//     failed installation (state discarded and retried).
+func (f *Filesystem) unmount(mountpoint string) error {
+	f.log.Info("unmounting", "mountpoint", mountpoint)
+	var err error
+	usersLogged := false
+	for range 20 {
+		err = unix.Unmount(mountpoint, 0)
+		if err == nil {
+			return nil
+		}
+		if !errors.Is(err, unix.EBUSY) {
+			break
+		}
+		if !usersLogged {
+			// Scan on the FIRST EBUSY, not only after the retries: a transient pinner is
+			// often gone by the time the loop gives up - and if a later retry succeeds,
+			// the culprit would otherwise never be seen at all.
+			f.log.Warn("mountpoint busy, scanning for processes pinning it", "mountpoint", mountpoint)
+			f.logMountUsers(mountpoint)
+			usersLogged = true
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+
+	f.log.Error("unable to unmount", "mountpoint", mountpoint, "error", err)
+	if errors.Is(err, unix.EBUSY) {
+		// scan again: the set of pinning processes may have changed during the retries.
+		f.logMountUsers(mountpoint)
+	}
+	return fmt.Errorf("unable to unmount %s: %w", mountpoint, err)
+}
+
+// logMountUsers scans /proc for processes holding references (open fds, cwd, root) into the
+// given mountpoint, so a persistent EBUSY can actually be root-caused from the install log.
+func (f *Filesystem) logMountUsers(mountpoint string) {
+	prefix := mountpoint + "/"
+	procs, err := filepath.Glob("/proc/[0-9]*")
+	if err != nil {
+		return
+	}
+	for _, p := range procs {
+		pid := filepath.Base(p)
+		comm, _ := gos.ReadFile(path.Join(p, "comm"))
+		for _, link := range []string{"cwd", "root"} {
+			if target, err := gos.Readlink(path.Join(p, link)); err == nil {
+				if target == mountpoint || strings.HasPrefix(target, prefix) {
+					f.log.Error("mount pinned by process", "mountpoint", mountpoint, "pid", pid, "comm", strings.TrimSpace(string(comm)), "via", link, "target", target)
+				}
+			}
+		}
+		fds, err := filepath.Glob(path.Join(p, "fd", "*"))
 		if err != nil {
-			f.log.Error("unable to unmount", "path", m, "error", err)
+			continue
+		}
+		for _, fd := range fds {
+			if target, err := gos.Readlink(fd); err == nil {
+				if target == mountpoint || strings.HasPrefix(target, prefix) {
+					f.log.Error("mount pinned by process", "mountpoint", mountpoint, "pid", pid, "comm", strings.TrimSpace(string(comm)), "via", "fd", "target", target)
+				}
+			}
 		}
 	}
 }
